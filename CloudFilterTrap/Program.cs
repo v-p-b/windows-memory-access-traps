@@ -17,12 +17,102 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 namespace CloudFilterTrap;
 
 static class Program
 {
+    /* All hail our AI overlords (generated with Gemini) */
+    public static void HexDump(IntPtr address, int length)
+    {
+        if (address == IntPtr.Zero)
+        {
+            Console.WriteLine("Error: IntPtr is null.");
+            return;
+        }
+        if (length <= 0)
+        {
+            Console.WriteLine("Error: Length must be greater than zero.");
+            return;
+        }
+
+        // Determine the number of bytes per line for the hexdump display
+        const int bytesPerLine = 16;
+
+        // Create a managed byte array to hold the data copied from unmanaged memory
+        byte[] buffer = new byte[length];
+
+        try
+        {
+            // Copy data from the unmanaged memory address to the managed byte array
+            // This is the correct way to read bytes from an IntPtr into a managed byte array. 【1】
+            Marshal.Copy(address, buffer, 0, length);
+        }
+        catch (AccessViolationException ex)
+        {
+            Console.WriteLine($"Error: Could not access unmanaged memory. {ex.Message}");
+            return;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"An unexpected error occurred during memory copy: {ex.Message}");
+            return;
+        }
+
+        Console.WriteLine($"Hexdump of memory at 0x{address.ToInt64():X}:");
+        Console.WriteLine("--------------------------------------------------------------------------------");
+
+        // Iterate through the buffer, processing bytes in chunks of bytesPerLine
+        for (int i = 0; i < length; i += bytesPerLine)
+        {
+            // Print the current offset in hexadecimal
+            Console.Write($"0x{i:X8} | ");
+
+            // Build the hexadecimal string for the current line
+            StringBuilder hexLine = new StringBuilder();
+            // Build the ASCII string for the current line
+            StringBuilder asciiLine = new StringBuilder();
+
+            for (int j = 0; j < bytesPerLine; j++)
+            {
+                if (i + j < length)
+                {
+                    byte b = buffer[i + j];
+                    // Append the byte as a two-digit hexadecimal string
+                    hexLine.Append($"{b:X2} ");
+
+                    // Append the ASCII character, replacing non-printable characters with '.'
+                    if (b >= 32 && b <= 126) // Printable ASCII range
+                    {
+                        asciiLine.Append((char)b);
+                    }
+                    else
+                    {
+                        asciiLine.Append('.');
+                    }
+                }
+                else
+                {
+                    // Pad with spaces if we're at the end of the data and the line isn't full
+                    hexLine.Append("   ");
+                    asciiLine.Append(' ');
+                }
+
+                // Add an extra space in the hex section for better readability after 8 bytes
+                if (j == 7)
+                {
+                    hexLine.Append(" ");
+                }
+            }
+
+            // Print the formatted hexadecimal and ASCII lines
+            Console.WriteLine($"{hexLine}| {asciiLine}");
+        }
+        Console.WriteLine("--------------------------------------------------------------------------------");
+    }
+
     [StructLayout(LayoutKind.Explicit)]
     public struct LargeIntegerStruct
     {
@@ -694,9 +784,18 @@ static class Program
 
     static Guid ProviderId = new Guid("{B196E670-59C7-4D41-9637-C62D80541321}");
     static AutoResetEvent ContinueEvent = new AutoResetEvent(false);
+    static bool run = true;
+    static bool restart = true;
+    static IntPtr nativeCallback = IntPtr.Zero;
+    static IntPtr nativeBuffer = IntPtr.Zero;
+    static int nativeBufferSize = 0;
+    delegate void CFuncDelegate();
 
     [DllImport("kernel32.dll")]
     static extern void RtlZeroMemory(IntPtr dst, IntPtr length);
+
+    [DllImport("kernel32.dll")]
+    static extern void RtlCopyMemory(IntPtr Destination, IntPtr Source, IntPtr Length);
 
     static int Check(this int hr)
     {
@@ -723,28 +822,18 @@ static class Program
             int offset = (int)ps.RequiredFileOffset.QuadPart;
             Console.WriteLine("Requesting offset 0x{0:X08} length 0x{1:X08}", offset, length);
 
+            // https://stackoverflow.com/questions/2470487/call-c-function-pointer-from-c-sharp/2472299#2472299
+            CFuncDelegate func = (CFuncDelegate)Marshal.GetDelegateForFunctionPointer<CFuncDelegate>(nativeCallback); // IL3050
             IntPtr buffer = Marshal.AllocHGlobal(new IntPtr(length));
             RtlZeroMemory(buffer, new IntPtr(length));
+            if (nativeBuffer != IntPtr.Zero && offset == 0) {
+                func(); // Native callback
+                RtlCopyMemory(buffer, nativeBuffer, nativeBufferSize);
+                HexDump(buffer, nativeBufferSize);
+            }
+            
             try
             {
-                for (int i = 0; i < length; i += 4)
-                {
-                    int base_address = offset % (512 * 1024 * 1024);
-                    Marshal.WriteInt32(buffer + i, (base_address + i) * 8);
-                }
-
-                if (offset >= (512 * 1024 * 1024) && (offset < (1000 * 1024 * 1024)))
-                {
-                    Console.WriteLine("====> Trapping for offset {0:X}", offset);
-                    Console.WriteLine("====> Type 'c' and ENTER to continue.");
-                    ContinueEvent.WaitOne();
-                    Console.WriteLine("====> Continuing.");
-                }
-                else
-                {
-                    Thread.Sleep(1000);
-                }
-
                 opParams.ParamSize = Marshal.SizeOf(opParams);
                 opParams.CompletionStatus = 0;
                 opParams.Buffer = buffer;
@@ -752,11 +841,12 @@ static class Program
                 opParams.Length = ps.RequiredLength;
 
                 CfExecute(opInfo, ref opParams).Check();
-                Console.WriteLine("Written Buffer.");
+            
             }
             finally
             {
                 Marshal.FreeHGlobal(buffer);
+
             }
         }
         catch (Exception ex)
@@ -765,17 +855,42 @@ static class Program
         }
     }
 
-    static void Main(string[] args)
+    [UnmanagedCallersOnly(EntryPoint = "resume")]
+    static void Continue() {
+        ContinueEvent.Set();
+    }
+    
+    [UnmanagedCallersOnly(EntryPoint = "restart")]
+    static void Restart() {
+        run=false;
+    }
+
+    [UnmanagedCallersOnly(EntryPoint = "stop")]
+    static void Stop() {
+        restart = false;
+        run=false;
+    }
+
+    [UnmanagedCallersOnly(EntryPoint = "set_callback")]
+    static void SetCallback(IntPtr fPtr) {
+        nativeCallback = fPtr;
+    }
+
+    [UnmanagedCallersOnly(EntryPoint = "set_buffer")]
+    static void SetBuffer(IntPtr buf, int size) {
+        nativeBuffer = buf;
+        nativeBufferSize = size;
+        Console.WriteLine("[Cf] Native buffer set to:");
+        HexDump(nativeBuffer, nativeBufferSize);
+    }
+
+
+    [UnmanagedCallersOnly(EntryPoint="serve")]
+    static void Serve(IntPtr dummy)
     {
         try
         {
-            if (args.Length < 1)
-            {
-                Console.WriteLine("Specify a syncroot directory.");
-                return;
-            }
-
-            string SyncRoot = Path.GetFullPath(args[0]);
+            string SyncRoot = "C:\\root";
             string FilePath = @"file.bin";
 
             if (!Directory.Exists(SyncRoot))
@@ -788,7 +903,6 @@ static class Program
                 File.Delete(Path.Combine(SyncRoot, FilePath));
             }
 
-            bool restart = true;
             while(restart)
             {
                 CF_SYNC_REGISTRATION reg = new CF_SYNC_REGISTRATION();
@@ -839,20 +953,10 @@ static class Program
                         CfCreatePlaceholders(SyncRoot, place_holders, 1,
                             CF_CREATE_FLAGS.CF_CREATE_FLAG_STOP_ON_ERROR, out int processed).Check();
                         Console.WriteLine("Started");
-                        string line = Console.ReadLine()?.Trim();
-                        while (line != null)
+                        run = true;
+                        while (run)
                         {
-                            line = line.ToLower();
-                            if (line == "x")
-                            {
-                                restart = false;
-                                break;
-                            }
-                            if (line == "c")
-                                ContinueEvent.Set();
-                            if (line == "r")
-                                break;
-                            line = Console.ReadLine()?.Trim();
+                            Thread.Sleep(100);
                         }
                     }
                     finally
