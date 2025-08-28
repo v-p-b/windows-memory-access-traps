@@ -1,3 +1,10 @@
+This branch implements a library interface for `CloudFilterTrap`. Compile it to a native dynamic library with the following command:
+
+```
+cd CloudFilterTrap
+dotnet publish -r win-x64 -c Debug
+```
+
 # Example code for Windows Memory Trap servers.
 (c) James Forshaw 2021-2024
 
